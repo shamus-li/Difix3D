@@ -1,13 +1,14 @@
-import os
 import json
+import os
+import re
 from typing import Any, Dict, List, Optional
-from typing_extensions import assert_never
 
 import cv2
 import imageio.v2 as imageio
 import numpy as np
 import torch
 from pycolmap import SceneManager
+from typing_extensions import assert_never
 
 from .normalize import (
     align_principle_axes,
@@ -43,11 +44,11 @@ class Parser:
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
-            # colmap_dir = os.path.join(data_dir, "sparse")
-            colmap_dir = os.path.join(data_dir, "colmap/sparse/0")
-        assert os.path.exists(
-            colmap_dir
-        ), f"COLMAP directory {colmap_dir} does not exist."
+            colmap_dir = os.path.join(data_dir, "sparse")
+            # colmap_dir = os.path.join(data_dir, "colmap/sparse/0")
+        assert os.path.exists(colmap_dir), (
+            f"COLMAP directory {colmap_dir} does not exist."
+        )
 
         manager = SceneManager(colmap_dir)
         manager.load_cameras()
@@ -101,9 +102,9 @@ class Parser:
             elif type_ == 5 or type_ == "OPENCV_FISHEYE":
                 params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
                 camtype = "fisheye"
-            assert (
-                camtype == "perspective" or camtype == "fisheye"
-            ), f"Only perspective and fisheye cameras are supported, got {type_}"
+            assert camtype == "perspective" or camtype == "fisheye", (
+                f"Only perspective and fisheye cameras are supported, got {type_}"
+            )
 
             params_dict[camera_id] = params
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
@@ -163,24 +164,38 @@ class Parser:
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
         if "3dv-dataset-nerfstudio" in data_dir:
-            colmap_files = sorted(_get_rel_paths(colmap_image_dir), key=lambda x: int(x.split(".")[0].split("_")[-1]))
-            image_files = sorted(_get_rel_paths(image_dir), key=lambda x: int(x.split(".")[0].split("_")[-1]))
+            colmap_files = sorted(
+                _get_rel_paths(colmap_image_dir),
+                key=lambda x: int(x.split(".")[0].split("_")[-1]),
+            )
+            image_files = sorted(
+                _get_rel_paths(image_dir),
+                key=lambda x: int(x.split(".")[0].split("_")[-1]),
+            )
             colmap_to_image = dict(zip(colmap_files, image_files))
             image_names = colmap_files
-            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+            image_paths = [
+                os.path.join(image_dir, colmap_to_image[f]) for f in image_names
+            ]
         elif "DL3DV-Benchmark" in data_dir:
             colmap_files = sorted(_get_rel_paths(colmap_image_dir))
             image_files = sorted(_get_rel_paths(image_dir))
             colmap_to_image = dict(zip(colmap_files, image_files))
             if len(colmap_files) != len(image_names):
-                print(f"Warning: colmap_files: {len(colmap_files)}, image_names: {len(image_names)}")
+                print(
+                    f"Warning: colmap_files: {len(colmap_files)}, image_names: {len(image_names)}"
+                )
                 image_names = colmap_files
-            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+            image_paths = [
+                os.path.join(image_dir, colmap_to_image[f]) for f in image_names
+            ]
         else:
             colmap_files = sorted(_get_rel_paths(colmap_image_dir))
             image_files = sorted(_get_rel_paths(image_dir))
             colmap_to_image = dict(zip(colmap_files, image_files))
-            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+            image_paths = [
+                os.path.join(image_dir, colmap_to_image[f]) for f in image_names
+            ]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -249,9 +264,9 @@ class Parser:
             if len(params) == 0:
                 continue  # no distortion
             assert camera_id in self.Ks_dict, f"Missing K for camera {camera_id}"
-            assert (
-                camera_id in self.params_dict
-            ), f"Missing params for camera {camera_id}"
+            assert camera_id in self.params_dict, (
+                f"Missing params for camera {camera_id}"
+            )
             K = self.Ks_dict[camera_id]
             width, height = self.imsize_dict[camera_id]
 
@@ -325,15 +340,19 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        match_string: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
-        
+
         indices = np.arange(len(self.parser.image_names))
         if self.parser.test_every == 1:
-            image_names = sorted(_get_rel_paths(f"{self.parser.data_dir}/images"), key=lambda x: int(x.split(".")[0].split("_")[-1]))
+            image_names = sorted(
+                _get_rel_paths(f"{self.parser.data_dir}/images"),
+                key=lambda x: int(x.split(".")[0].split("_")[-1]),
+            )
             assert len(image_names) == len(self.parser.image_names)
             if split == "train":
                 self.indices = [ind for ind in indices if "_train_" in image_names[ind]]
@@ -343,9 +362,18 @@ class Dataset:
             self.indices = indices
         else:
             if split == "train":
-                self.indices = indices[indices % self.parser.test_every == 0]
-            else:
                 self.indices = indices[indices % self.parser.test_every != 0]
+                if match_string:
+                    escaped = re.escape(match_string)
+                    pattern = re.compile(
+                        r"(?:(?<=\b)|(?<=_))" + escaped + r"(?:(?=\b)|(?=_))",
+                        re.IGNORECASE,
+                    )
+                    self.indices = [
+                        i for i in self.indices if pattern.search(self.parser.image_names[i])
+                    ]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
 
     def __len__(self):
         return len(self.indices)
@@ -386,11 +414,18 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
-        
+
         if self.parser.alpha_mask_paths is not None:
-            alpha_mask = imageio.imread(self.parser.alpha_mask_paths[index], mode="L")[:,:,None] / 255.0
+            alpha_mask = (
+                imageio.imread(self.parser.alpha_mask_paths[index], mode="L")[
+                    :, :, None
+                ]
+                / 255.0
+            )
             if self.patch_size is not None:
-                alpha_mask = alpha_mask[y : y + self.patch_size, x : x + self.patch_size]
+                alpha_mask = alpha_mask[
+                    y : y + self.patch_size, x : x + self.patch_size
+                ]
             data["alpha_mask"] = torch.from_numpy(alpha_mask).float()
 
         if self.load_depths:
