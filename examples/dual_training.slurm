@@ -2,13 +2,13 @@
 #SBATCH --job-name=difix_dual
 #SBATCH --output=slurm_logs/%A_%a.out
 #SBATCH --error=slurm_logs/%A_%a.err
-#SBATCH --partition=monakhova
-#SBATCH --exclude=lil-compute-05,unicorn-compute-01,bhattacharjee-compute-02
+#SBATCH --partition=default_partition
+#SBATCH --exclude=lil-compute-05,unicorn-compute-01,bhattacharjee-compute-02,awang-compute-01,kim-compute-03,kim-compute-04,kim-compute-05
 #SBATCH --gres=gpu:1
 #SBATCH --constraint="gpu-high"
 #SBATCH -N 1
 #SBATCH -n 2
-#SBATCH -t 12:00:00
+#SBATCH -t 24:00:00
 #SBATCH --mem 64gb
 #SBATCH --array=0-1
 
@@ -105,6 +105,20 @@ case "$RESULT_NAMING_DIR" in
         ;;
 esac
 DATA_NAME=$(basename "$RESULT_NAMING_DIR")
+if [ "$DATA_NAME" = "train" ] || [ "$DATA_NAME" = "test" ]; then
+    parent_dir=$(dirname "$RESULT_NAMING_DIR")
+    parent_name=$(basename "$parent_dir")
+    grandparent_dir=$(dirname "$parent_dir")
+    grandparent_name=$(basename "$grandparent_dir")
+
+    if [ -n "$parent_name" ] && [ "$parent_name" != "." ] && [ "$parent_name" != "/" ]; then
+        if [ -n "$grandparent_name" ] && [ "$grandparent_name" != "." ] && [ "$grandparent_name" != "/" ]; then
+            DATA_NAME="$grandparent_name/$parent_name"
+        else
+            DATA_NAME="$parent_name"
+        fi
+    fi
+fi
 RESULT_BASE="$RESULT_ROOT_ABS/$DATA_NAME"
 COMBINED_RESULT_DIR="$RESULT_BASE/combined"
 FILTERED_RESULT_DIR="$RESULT_BASE/filtered"
@@ -169,13 +183,18 @@ echo ""
 TRAIN_TEST_EVERY=${TRAIN_TEST_EVERY:-8}
 EVAL_TEST_EVERY=${EVAL_TEST_EVERY:-1}
 USE_COVISIBLE_EXTERNAL=${USE_COVISIBLE_EXTERNAL:-1}
-COVI_MICRO_CHUNK=${COVI_MICRO_CHUNK:-8}
+COVI_BATCH_SIZE=${COVI_BATCH_SIZE:-${COVI_CHUNK:-8}}
+COVI_NUM_WORKERS=${COVI_NUM_WORKERS:-${COVI_MICRO_CHUNK:-2}}
 COVI_DEVICE=${COVI_DEVICE:-cuda}
 EVAL_ALIGN_PATH_USER_SET=0
 if [ -n "${EVAL_ALIGN_PATH:-}" ]; then
     EVAL_ALIGN_PATH_USER_SET=1
 fi
 EVAL_ALIGN_PATH=${EVAL_ALIGN_PATH:-}
+EVAL_ALIGN_SOURCE=""
+if [ -n "$EVAL_ALIGN_PATH" ]; then
+    EVAL_ALIGN_SOURCE="env"
+fi
 ALIGN_ROOT=${ALIGN_ROOT:-$RESULT_DIR/alignments}
 
 # Build the training command
@@ -255,6 +274,7 @@ if [ -n "$EVAL_DIR" ]; then
                         --output "$default_align"
                     if [ -f "$default_align" ]; then
                         EVAL_ALIGN_PATH="$default_align"
+                        EVAL_ALIGN_SOURCE="computed"
                     fi
                 fi
                 if [ "$USE_COVISIBLE_EXTERNAL" = "1" ]; then
@@ -264,55 +284,58 @@ if [ -n "$EVAL_DIR" ]; then
                         COVI_MASK_DIR="$COVI_OUTPUT_ROOT/1x/val"
                         if [ ! -d "$COVI_MASK_DIR" ]; then
                             echo "Precomputing covisible masks for external eval dataset..."
+                            PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
                             python "$COVI_SCRIPT" \
                                 --base_dir "$EVAL_DATA_DIR" \
                                 --support_dir "$JOB_DATA_DIR" \
                                 --factor 1 \
                                 --test_every 1 \
                                 --support_test_every "$TRAIN_TEST_EVERY" \
-                                --micro_chunk "$COVI_MICRO_CHUNK" \
+                                --batch_size "$COVI_BATCH_SIZE" \
+                                --num_workers "$COVI_NUM_WORKERS" \
                                 --device "$COVI_DEVICE" \
                                 --output_dir "$COVI_OUTPUT_ROOT" \
                                 --base_split val \
-                                --support_split train \
-                                --chunk 32
+                                --support_split train
                         else
                             echo "Covisible masks exist at $COVI_MASK_DIR; skipping generation."
                         fi
                         covi_align="$COVI_OUTPUT_ROOT/alignment.npz"
                         if [ -f "$covi_align" ] && [ "$EVAL_ALIGN_PATH_USER_SET" -eq 0 ]; then
-                            if [ -n "$EVAL_ALIGN_PATH" ] && [ "$EVAL_ALIGN_PATH" != "$covi_align" ]; then
-                                echo "Overriding alignment with covisible metadata: $covi_align"
+                            if [ -z "$EVAL_ALIGN_PATH" ]; then
+                                EVAL_ALIGN_PATH="$covi_align"
+                                EVAL_ALIGN_SOURCE="covisible"
+                                echo "Using covisible metadata alignment at $covi_align"
+                            else
+                                echo "Keeping dataset alignment $EVAL_ALIGN_PATH (covisible metadata at $covi_align will not override)."
                             fi
-                            EVAL_ALIGN_PATH="$covi_align"
                         fi
                     else
                         echo "WARNING: Covisible script not found at $COVI_SCRIPT; skipping covisible preprocessing."
                     fi
                 fi
+                COVI_ROOT_GS="$RESULT_DIR/covisible/$EVAL_STEM/1x"
                 EVAL_CMD=(
-                    python "$GSPLAT_DIR/examples/simple_trainer.py" default
+                    python "$TRAINER_SCRIPT" default
                     --disable_viewer
                     --data_factor 1
                     --data_dir "$EVAL_DATA_DIR"
                     --result_dir "$EVAL_OUT_DIR"
                     --ckpt "$CKPT"
-                    --test_every 1
+                    --test_every "$EVAL_TEST_EVERY"
+                    --max_steps 30000
+                    --eval_only
                 )
                 if [ -n "$EVAL_ALIGN_PATH" ] && [ -f "$EVAL_ALIGN_PATH" ]; then
                     echo "Using dataset transform: $EVAL_ALIGN_PATH"
                     EVAL_CMD+=(--dataset_transform_path "$EVAL_ALIGN_PATH")
                 fi
                 if [ "$USE_COVISIBLE_EXTERNAL" = "1" ]; then
-                    COVI_ROOT_GS="$RESULT_DIR/covisible/$EVAL_STEM/1x"
                     if [ -d "$COVI_ROOT_GS" ]; then
-                        EVAL_CMD+=(--eval_use_covisible --eval_covisible_dir "$COVI_ROOT_GS")
+                        EVAL_CMD+=(--eval_use_covisible --eval_dycheck_metrics --eval_covisible_dir "$COVI_ROOT_GS")
                     else
                         echo "WARNING: Covisible directory $COVI_ROOT_GS missing; skipping covisible eval flags."
                     fi
-                fi
-                if [ -n "$EVAL_MATCH_STR" ]; then
-                    EVAL_CMD+=(--eval_match_string "$EVAL_MATCH_STR")
                 fi
                 echo "Executing external eval: ${EVAL_CMD[*]}"
                 "${EVAL_CMD[@]}"

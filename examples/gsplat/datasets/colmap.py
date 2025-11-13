@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import cv2
 import imageio.v2 as imageio
@@ -224,6 +224,10 @@ class Parser:
             points = transform_points(T2, points)
 
             transform = T2 @ T1
+
+            # Fix for up side down. We assume more points towards
+            # the bottom of the scene which is true when ground floor is
+            # present in the images.
         else:
             transform = np.eye(4)
 
@@ -341,11 +345,22 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         match_string: Optional[str] = None,
+        selected_images: Optional[Iterable[str]] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+
+        allowed_image_names: Optional[Set[str]] = None
+        if selected_images is not None:
+            allowed_image_names = {
+                name.strip() for name in selected_images if name and name.strip()
+            }
+            if not allowed_image_names:
+                raise ValueError(
+                    "selected_images was provided but no valid image names were found."
+                )
 
         indices = np.arange(len(self.parser.image_names))
         if self.parser.test_every == 1:
@@ -359,21 +374,54 @@ class Dataset:
             else:
                 self.indices = [ind for ind in indices if "_eval_" in image_names[ind]]
         elif self.parser.test_every == 0:
-            self.indices = indices
+            self.indices = list(indices)
         else:
-            if split == "train":
-                self.indices = indices[indices % self.parser.test_every != 0]
-                if match_string:
-                    escaped = re.escape(match_string)
-                    pattern = re.compile(
-                        r"(?:(?<=\b)|(?<=_))" + escaped + r"(?:(?=\b)|(?=_))",
-                        re.IGNORECASE,
+            train_indices = indices[indices % self.parser.test_every != 0]
+            val_indices = indices[indices % self.parser.test_every == 0]
+
+            def _filter_by_match(source_indices: Iterable[int], label: str) -> List[int]:
+                if not match_string:
+                    return list(source_indices)
+                escaped = re.escape(match_string)
+                pattern = re.compile(
+                    rf"(?:(?<=\b)|(?<=_)){escaped}(?:(?=\b)|(?=_))",
+                    re.IGNORECASE,
+                )
+                filtered = [
+                    i
+                    for i in source_indices
+                    if pattern.search(self.parser.image_names[i])
+                ]
+                if not filtered:
+                    raise ValueError(
+                        f"No {label} images matched '{match_string}'. "
+                        "Adjust the filter or verify the dataset contents."
                     )
+                return filtered
+
+            if split == "train":
+                self.indices = _filter_by_match(train_indices, "training")
+                if allowed_image_names is not None:
                     self.indices = [
-                        i for i in self.indices if pattern.search(self.parser.image_names[i])
+                        i
+                        for i in self.indices
+                        if self.parser.image_names[i] in allowed_image_names
                     ]
+                    if not self.indices:
+                        raise ValueError(
+                            "No training images left after applying selected_images."
+                        )
             else:
-                self.indices = indices[indices % self.parser.test_every == 0]
+                self.indices = _filter_by_match(val_indices, "evaluation")
+
+        if split != "train" and allowed_image_names is not None:
+            self.indices = [
+                i for i in self.indices if self.parser.image_names[i] in allowed_image_names
+            ]
+            if not self.indices:
+                raise ValueError(
+                    "No evaluation images left after applying selected_images."
+                )
 
     def __len__(self):
         return len(self.indices)

@@ -199,6 +199,37 @@ CUDA_VISIBLE_DEVICES=0 python examples/gsplat/simple_trainer_difix3d.py default 
     --result_dir ${OUTPUT_DIR} --no-normalize-world-space --test_every 1 --ckpt ${CKPT_PATH}
 ```
 
+#### DyCheck-Style Masked Evaluation
+
+Use co-visibility masks to report DyCheck-compliant metrics when running the gsplat
+trainer inside Difix3D.
+
+1. **Generate covisible masks** with the shared gsplat script (reuses RAFT from the
+   `dycheck` submodule and stores results under `<dataset>/covisible/<factor>x`):
+
+   ```bash
+   python ../gsplat/examples/preprocess_covisible_colmap.py \
+       --base_dir DATA_DIR/${SCENE_ID}/gaussian_splat/test \
+       --support_dir DATA_DIR/${SCENE_ID}/gaussian_splat/train \
+       --factor 1 --base_split val --support_split train \
+       --batch_size 16 --max_hw 512
+   ```
+
+2. **Evaluate with masked metrics** by pointing the trainer at the covisible directory:
+
+   ```bash
+   python examples/gsplat/simple_trainer_difix3d.py default \
+       --data_dir DATA_DIR/${SCENE_ID}/gaussian_splat/test \
+       --result_dir ${OUTPUT_DIR}/eval_on_test \
+       --ckpt ${CKPT_PATH} --eval_only \
+       --eval_use_covisible \
+       --eval_dycheck_metrics \
+       --eval_covisible_dir ${OUTPUT_DIR}/covisible/test/1x
+   ```
+
+The evaluation JSON now contains both full-frame (`psnr`, `ssim`, `lpips`) and
+DyCheck-style masked metrics (`mpsnr`, `mssim`, `mlpips`) plus average mask coverage.
+
 
 ## Difix3D+: With real-time post-rendering
 

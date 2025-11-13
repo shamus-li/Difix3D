@@ -6,7 +6,9 @@ import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from pathlib import Path
+import shutil
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import imageio
 import nerfview
@@ -17,7 +19,7 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Dataset, Parser, transform_cameras, transform_points
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -40,25 +42,109 @@ from PIL import Image
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from examples.utils import CameraPoseInterpolator
 from src.pipeline_difix import DifixPipeline
+from gsplat.metrics import dycheck as dy_metrics
+
+
+def _alignment_dirs_to_probe(
+    result_dir: Path, data_dir: Path, ckpt_paths: Optional[Iterable[str]]
+) -> List[Path]:
+    dirs: List[Path] = []
+    run_dirs: List[Path] = []
+    seen: Set[Path] = set()
+
+    def maybe_add(path: Path) -> None:
+        if path in seen:
+            return
+        seen.add(path)
+        if path.is_dir():
+            dirs.append(path)
+
+    if result_dir:
+        ancestors: Iterable[Path] = [result_dir] + list(result_dir.parents)
+        for ancestor in ancestors:
+            maybe_add(ancestor / "alignments")
+            if ancestor.name == "results":
+                break
+    data_align_dir = data_dir.parent / "alignments"
+    maybe_add(data_align_dir)
+    covisible_candidates = [data_dir]
+    covisible_candidates.extend(data_dir.parents)
+    subset_token = data_dir.name
+    for ancestor in covisible_candidates:
+        covi_root = ancestor / "covisible"
+        maybe_add(covi_root)
+        maybe_add(covi_root / subset_token)
+
+    if ckpt_paths:
+        for ckpt in ckpt_paths:
+            ckpt_path = Path(ckpt).expanduser()
+            run_root = ckpt_path.parent.parent if ckpt_path.parent.name == "ckpts" else ckpt_path.parent
+            path = run_root / "alignments"
+            if path not in run_dirs and path.is_dir():
+                run_dirs.append(path)
+                seen.add(path)
+    return run_dirs + dirs
+
+
+def _pick_alignment_file(align_dir: Path, subset_token: str) -> Optional[Path]:
+    patterns = (
+        f"{subset_token}_to_*.npz",
+        f"*_{subset_token}.npz",
+        f"{subset_token}.npz",
+    )
+    for pattern in patterns:
+        matches = sorted(align_dir.glob(pattern))
+        if matches:
+            return matches[0]
+    matches = sorted(align_dir.glob("*.npz"))
+    return matches[0] if matches else None
+
+
+def _resolve_alignment_path(cfg: "Config") -> Optional[Path]:
+    if cfg.dataset_transform_path:
+        return Path(cfg.dataset_transform_path).expanduser()
+
+    result_dir = Path(cfg.result_dir).expanduser()
+    data_dir = Path(cfg.data_dir).expanduser()
+    subset_token = data_dir.name
+
+    for align_dir in _alignment_dirs_to_probe(result_dir, data_dir, cfg.ckpt):
+        candidate = _pick_alignment_file(align_dir, subset_token)
+        if candidate is not None:
+            cfg.dataset_transform_path = candidate.as_posix()
+            return candidate
+    return None
 
 
 @dataclass
 class Config:
     # Disable viewer
     disable_viewer: bool = True  # ! turn off viser
+    # Apply Difix fixer during evaluation (external eval or metrics export)
+    eval_use_difix: bool = False
+    eval_difix_prompt: str = "remove degradation"
+    eval_difix_num_inference_steps: int = 1
+    eval_difix_timestep: int = 199
+    eval_difix_guidance_scale: float = 0.0
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Run evaluation-only pipeline (render + Difix fixer) when ckpt is provided.
+    eval_only: bool = False
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
+    # Whether to render a novel-view trajectory during eval-only. Default off
+    # to reduce disk usage and avoid quota issues when running batch eval.
+    render_eval_traj: bool = False
+    # Always write GT/Pred/Alpha frames; metrics may use covisible masks but
+    # visualization remains unmasked predictions. (Kept for compatibility.)
+    vis_pred_only: bool = False
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -187,6 +273,17 @@ class Config:
     antialiased: bool = False
     # Match string for training images
     match_string: Optional[str] = None
+    # Match string for evaluation images; defaults to match_string when unset
+    eval_match_string: Optional[str] = None
+    # Use covisible masks (if available) for evaluation metrics
+    eval_use_covisible: bool = False
+    # Optional explicit path to covisible masks root. If not set and
+    # eval_use_covisible is True, defaults to f"{data_dir}/covisible/{data_factor}x"
+    eval_covisible_dir: Optional[str] = None
+    # Enable DyCheck-style masked metrics (auto-enabled when eval_use_covisible=True)
+    eval_dycheck_metrics: bool = False
+    # Optional dataset alignment transform (npz/npy) applied before evaluation.
+    dataset_transform_path: Optional[str] = None
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -364,6 +461,29 @@ class Runner:
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
 
+        self.covisible_root: Optional[Path] = None
+        self._warned_missing_covisible = False
+        self._warned_stage_fallback = False
+        self._auto_alignment_path: Optional[Path] = None
+        if cfg.eval_use_covisible:
+            root = (
+                Path(cfg.eval_covisible_dir).expanduser()
+                if cfg.eval_covisible_dir
+                else Path(cfg.data_dir) / "covisible" / f"{cfg.data_factor}x"
+            )
+            if root.exists():
+                self.covisible_root = root
+                print(f"[Info] Using covisible masks from: {root}")
+            else:
+                print(f"[Warning] Covisible root not found: {root}")
+            cfg.eval_dycheck_metrics = True
+
+        original_alignment = cfg.dataset_transform_path
+        resolved_alignment = _resolve_alignment_path(cfg)
+        if resolved_alignment is not None and original_alignment is None:
+            self._auto_alignment_path = resolved_alignment
+            print(f"[Info] Applying dataset alignment from: {resolved_alignment}")
+
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
@@ -374,6 +494,33 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
+        if cfg.dataset_transform_path is not None:
+            transform_path = Path(cfg.dataset_transform_path).expanduser()
+            if not transform_path.exists():
+                raise FileNotFoundError(
+                    f"Dataset transform file '{transform_path}' does not exist."
+                )
+            loaded = np.load(transform_path)
+            if isinstance(loaded, np.ndarray):
+                align_transform = loaded
+            elif isinstance(loaded, np.lib.npyio.NpzFile) and "align_transform" in loaded:
+                align_transform = loaded["align_transform"]
+                loaded.close()
+            else:
+                raise KeyError(
+                    f"Dataset transform '{transform_path}' does not contain 'align_transform'."
+                )
+            align_transform = np.asarray(align_transform, dtype=np.float32)
+            self.parser.camtoworlds = transform_cameras(
+                align_transform, self.parser.camtoworlds
+            )
+            self.parser.points = transform_points(align_transform, self.parser.points)
+            self.parser.transform = align_transform @ self.parser.transform
+
+            camera_locations = self.parser.camtoworlds[:, :3, 3]
+            scene_center = np.mean(camera_locations, axis=0)
+            dists = np.linalg.norm(camera_locations - scene_center, axis=1)
+            self.parser.scene_scale = np.max(dists)
         self.trainset = Dataset(
             self.parser,
             split="train",
@@ -383,16 +530,28 @@ class Runner:
         )
         train_count = len(self.trainset)
         print("Training set size:", train_count)
+        # Align behavior with gsplat: allow eval-only/ckpt flows to proceed even when the
+        # training split is empty (e.g., when evaluating on a test-only dataset).
         if train_count == 0:
-            if cfg.match_string:
+            if cfg.match_string and not (cfg.ckpt or cfg.eval_only):
                 raise ValueError(
                     f"Training set is empty after applying match_string='{cfg.match_string}'."
                     " Adjust the filter or verify the dataset contents."
                 )
-            raise ValueError(
-                "Training set is empty. Verify that the dataset path and contents are correct."
-            )
-        self.valset = Dataset(self.parser, split="val")
+            if cfg.ckpt or cfg.eval_only:
+                print(
+                    "Warning: Training set is empty; continuing because a checkpoint/eval-only is provided."
+                )
+            else:
+                raise ValueError(
+                    "Training set is empty. Verify that the dataset path and contents are correct."
+                )
+        val_match_string = cfg.eval_match_string
+        self.valset = Dataset(
+            self.parser,
+            split="val",
+            match_string=val_match_string,
+        )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -496,21 +655,9 @@ class Runner:
                 ),
             ]
 
-        # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
-
-        if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
-        elif cfg.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
-        else:
+        if cfg.lpips_net not in ("alex", "vgg"):
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
+        self.lpips_net = cfg.lpips_net
 
         # Viewer
         if not self.cfg.disable_viewer:
@@ -531,6 +678,12 @@ class Runner:
 
         self.novelloaders = []
         self.novelloaders_iter = []
+
+        self.eval_reference_images: Dict[int, Path] = {}
+        self._eval_ref_image_cache: Dict[int, Image.Image] = {}
+        self._warned_missing_eval_ref = False
+        if cfg.eval_use_difix:
+            self.eval_reference_images = self._build_eval_reference_mapping()
 
         # Diffusion fixer
         self.difix = DifixPipeline.from_pretrained(
@@ -1057,12 +1210,22 @@ class Runner:
         world_rank = self.world_rank
         world_size = self.world_size
 
+        if world_rank == 0:
+            stage_root = Path(self.render_dir) / stage / f"{step}"
+            if stage_root.exists():
+                shutil.rmtree(stage_root)
+            for stale in Path(self.render_dir).glob(f"{stage}_step{step:04d}_*.png"):
+                try:
+                    stale.unlink()
+                except FileNotFoundError:
+                    pass
+
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
-        ellipse_time = 0
+        ellipse_time = 0.0
         metrics = defaultdict(list)
-        for i, data in enumerate(tqdm.tqdm(valloader)):
+        for i, data in enumerate(tqdm.tqdm(valloader, desc=f"Eval-{stage}")):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
@@ -1082,42 +1245,90 @@ class Runner:
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
-            ellipse_time += time.time() - tic
+            ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
+            colors_for_vis = colors
+
+            pixels_p = pixels.permute(0, 3, 1, 2)
+            colors_p = colors.permute(0, 3, 1, 2)
+
+            metrics["psnr"].append(dy_metrics.psnr(colors_p, pixels_p))
+            metrics["ssim"].append(dy_metrics.ssim(colors_p, pixels_p))
+            metrics["lpips"].append(dy_metrics.lpips(colors_p, pixels_p, net=cfg.lpips_net))
+
+            if self.covisible_root is not None and cfg.eval_dycheck_metrics:
+                try:
+                    dataset_index = self.valset.indices[i]
+                    image_name = self.parser.image_names[dataset_index]
+                    stage_dir = self.covisible_root / stage
+                    if not stage_dir.exists():
+                        fallback = self.covisible_root / "val"
+                        if fallback.exists():
+                            if not self._warned_stage_fallback:
+                                print(
+                                    f"[covisible] Missing masks under '{stage_dir}'. Falling back to '{fallback}'."
+                                )
+                                self._warned_stage_fallback = True
+                            stage_dir = fallback
+                        else:
+                            if not self._warned_missing_covisible:
+                                print(
+                                    f"[Warning] Covisible directory '{stage_dir}' (or fallback '{fallback}') missing."
+                                )
+                                self._warned_missing_covisible = True
+                            continue
+                    mask_path = stage_dir / Path(image_name).with_suffix(".png")
+                    if mask_path.exists():
+                        mask_np = imageio.imread(mask_path.as_posix())
+                        if mask_np.ndim == 3:
+                            mask_np = mask_np[..., 0]
+                        mask_t = torch.from_numpy((mask_np > 127).astype(np.float32)).to(device)
+                        mask_t = mask_t[None, None, :, :]
+                        if mask_t.shape[-2:] != (height, width):
+                            mask_t = F.interpolate(mask_t, size=(height, width), mode="nearest")
+                        coverage = mask_t.sum().item() / (height * width)
+                        metrics["mask_coverage"].append(torch.tensor(coverage, device=device))
+                        if coverage > 1e-5:
+                            metrics["mpsnr"].append(dy_metrics.mpsnr(colors_p, pixels_p, mask_t))
+                            metrics["mssim"].append(dy_metrics.mssim(colors_p, pixels_p, mask_t))
+                            metrics["mlpips"].append(
+                                dy_metrics.mlpips(colors_p, pixels_p, mask_t, net=cfg.lpips_net)
+                            )
+                except Exception as e:  # noqa: BLE001
+                    if not self._warned_missing_covisible:
+                        print(
+                            "Warning: Failed to load covisible mask for evaluation "
+                            f"(first occurrence). Continuing without masks. Error: {e}"
+                        )
+                        self._warned_missing_covisible = True
 
             if world_rank == 0:
-                # write images
-                pixels_path = f"{self.render_dir}/val/{step}/GT/{i:04d}.png"
-                os.makedirs(os.path.dirname(pixels_path), exist_ok=True)
-                pixels_canvas = pixels.squeeze(0).cpu().numpy()
-                pixels_canvas = (pixels_canvas * 255).astype(np.uint8)
-                imageio.imwrite(pixels_path, pixels_canvas)
+                gt_dir = Path(self.render_dir) / stage / f"{step}" / "GT"
+                pred_dir = Path(self.render_dir) / stage / f"{step}" / "Pred"
+                alpha_dir = Path(self.render_dir) / stage / f"{step}" / "Alpha"
+                gt_dir.mkdir(parents=True, exist_ok=True)
+                pred_dir.mkdir(parents=True, exist_ok=True)
+                alpha_dir.mkdir(parents=True, exist_ok=True)
 
-                colors_path = f"{self.render_dir}/val/{step}/Pred/{i:04d}.png"
-                os.makedirs(os.path.dirname(colors_path), exist_ok=True)
-                colors_canvas = colors.squeeze(0).cpu().numpy()
-                colors_canvas = (colors_canvas * 255).astype(np.uint8)
-                imageio.imwrite(colors_path, colors_canvas)
+                if not cfg.vis_pred_only:
+                    pixels_canvas = (pixels.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                    imageio.imwrite((gt_dir / f"{i:04d}.png").as_posix(), pixels_canvas)
 
-                alphas_path = f"{self.render_dir}/val/{step}/Alpha/{i:04d}.png"
-                os.makedirs(os.path.dirname(alphas_path), exist_ok=True)
-                alphas_canvas = (alphas < 0.5).squeeze(0).cpu().numpy()
-                alphas_canvas = (alphas_canvas * 255).astype(np.uint8)
-                Image.fromarray(alphas_canvas.squeeze(), mode="L").save(alphas_path)
+                colors_canvas = (colors_for_vis.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                imageio.imwrite((pred_dir / f"{i:04d}.png").as_posix(), colors_canvas)
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                alphas_canvas = ((alphas < 0.5).squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                Image.fromarray(alphas_canvas.squeeze(), mode="L").save(alpha_dir / f"{i:04d}.png")
+
                 if cfg.use_bilateral_grid:
-                    cc_colors = color_correct(colors, pixels)
+                    cc_colors = color_correct(colors_for_vis, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
+                    metrics["cc_psnr"].append(dy_metrics.psnr(cc_colors_p, pixels_p))
+                    metrics["cc_ssim"].append(dy_metrics.ssim(cc_colors_p, pixels_p))
+                    metrics["cc_lpips"].append(dy_metrics.lpips(cc_colors_p, pixels_p, net=cfg.lpips_net))
 
-        if world_rank == 0:
+        if world_rank == 0 and len(valloader) > 0:
             ellipse_time /= len(valloader)
 
             stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
@@ -1132,10 +1343,8 @@ class Runner:
                 f"Time: {stats['ellipse_time']:.3f}s/image "
                 f"Number of GS: {stats['num_GS']}"
             )
-            # save stats as json
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
-            # save stats to tensorboard
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
@@ -1183,27 +1392,39 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        for i in tqdm.trange(
-            0, len(camtoworlds_all), batch_size, desc="Rendering trajectory"
-        ):
-            camtoworlds = camtoworlds_all[i : i + batch_size]
+        current_batch = max(1, batch_size)
+        i = 0
+        pbar = tqdm.tqdm(total=len(camtoworlds_all), desc="Rendering trajectory")
+        while i < len(camtoworlds_all):
+            chunk = min(current_batch, len(camtoworlds_all) - i)
+            camtoworlds = camtoworlds_all[i : i + chunk]
             Ks = K[None].repeat(camtoworlds.shape[0], 1, 1)
-
-            renders, alphas, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [B, H, W, 4]
+            try:
+                renders, alphas, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                )  # [B, H, W, 4]
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if chunk == 1:
+                    raise
+                current_batch = max(1, chunk // 2)
+                print(
+                    f"[render_traj] CUDA OOM encountered; reducing batch size to {current_batch} and retrying."
+                )
+                continue
 
             for j in range(renders.shape[0]):
                 colors = torch.clamp(renders[j, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
                 depths = renders[j, ..., 3:4]  # [H, W, 1]
-                depths = (depths - depths.min()) / (depths.max() - depths.min())
+                denom = (depths.max() - depths.min()).clamp(min=1e-6)
+                depths = (depths - depths.min()) / denom
 
                 idx = i + j
                 colors_path = f"{self.render_dir}/{tag}/{step}/Pred/{idx:04d}.png"
@@ -1217,6 +1438,10 @@ class Runner:
                 alphas_canvas = alphas[j].float().cpu().numpy()
                 alphas_canvas = (alphas_canvas * 255).astype(np.uint8)
                 Image.fromarray(alphas_canvas.squeeze(), mode="L").save(alphas_path)
+
+            i += chunk
+            pbar.update(chunk)
+        pbar.close()
 
     @torch.no_grad()
     def run_compression(self, step: int):
@@ -1266,15 +1491,41 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
     if cfg.ckpt is not None:
-        # run eval only
+        # load checkpoint(s)
         ckpts = [
             torch.load(file, map_location=runner.device, weights_only=True)
             for file in cfg.ckpt
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        if cfg.pose_opt and "pose_adjust" in ckpts[0]:
+            pose_state = ckpts[0]["pose_adjust"]
+            target = runner.pose_adjust
+            if isinstance(target, torch.nn.parallel.DistributedDataParallel):
+                module = target.module
+            else:
+                module = target
+            current_state = module.state_dict()
+            shape_mismatch = any(
+                current_state[k].shape != pose_state.get(k, None).shape
+                for k in current_state
+            )
+            if shape_mismatch:
+                print(
+                    "[Warning] pose_adjust state shape mismatch; skipping pose restoration."
+                )
+            else:
+                module.load_state_dict(pose_state)
         step = ckpts[0]["step"]
-        runner.train(step=step)
+        if cfg.eval_only:
+            # Run metrics; optionally render trajectory if requested.
+            runner.eval(step=step)
+            if cfg.render_eval_traj:
+                runner.render_traj(step=step)
+            if cfg.compression is not None:
+                runner.run_compression(step=step)
+        else:
+            runner.train(step=step)
     else:
         runner.train()
 
